@@ -210,145 +210,6 @@ def ist_now():
     return datetime.now(IST)
 
 # ═══════════════════════════════════════════════════════════════
-#  MARKET REGIME + EARLY-STAGE FEATURES   (added in this revision)
-#  Fixes two problems:
-#   1) targets fail when the market falls  -> Nifty trend filter gates long signals
-#   2) signals appear after the rally      -> penalise stocks that already ran,
-#                                             reward pullback / coil / day-1 breakout
-# ═══════════════════════════════════════════════════════════════
-def stock_features(df):
-    """Extension + early-stage features from a daily OHLCV frame. {} if too short."""
-    try:
-        df = df.dropna(subset=["Close"])
-        if len(df) < 60:
-            return {}
-        c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
-        ltp = float(c.iloc[-1])
-        if ltp <= 0:
-            return {}
-        ema9 = c.ewm(span=9, adjust=False).mean()
-        ema21 = c.ewm(span=21, adjust=False).mean()
-        ema50 = c.ewm(span=50, adjust=False).mean()
-        prev_c = c.shift(1)
-        tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-        atr14 = float(tr.rolling(14).mean().iloc[-1])
-        if pd.isna(atr14) or atr14 <= 0:
-            atr14 = ltp * 0.02
-        rng = h - l
-        nr7 = bool(float(rng.iloc[-1]) <= float(rng.tail(7).min()) + 1e-9)
-        day_rng = float(h.iloc[-1] - l.iloc[-1])
-        close_pos = (ltp - float(l.iloc[-1])) / day_rng if day_rng > 0 else 0.5
-        high20_prev = float(h.iloc[-21:-1].max())
-        avg_v = float(v.tail(20).mean())
-        vol_ratio = float(v.iloc[-1]) / avg_v if avg_v > 0 else 1.0
-        delta = c.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rsi = float((100 - (100 / (1 + gain / loss.replace(0, 0.001)))).iloc[-1])
-        h52 = float(h.max())
-        return {
-            "ltp": ltp,
-            "ema9": float(ema9.iloc[-1]), "ema21": float(ema21.iloc[-1]),
-            "ema50": float(ema50.iloc[-1]),
-            "atr14": atr14, "nr7": nr7, "close_pos": close_pos,
-            "high20_prev": high20_prev, "vol_ratio": vol_ratio, "rsi": rsi,
-            "ret3": (ltp / float(c.iloc[-4]) - 1) * 100,
-            "ret5": (ltp / float(c.iloc[-6]) - 1) * 100,
-            "ret20": (ltp / float(c.iloc[-21]) - 1) * 100,
-            "ext21": (ltp / float(ema21.iloc[-1]) - 1) * 100,
-            "from_high": (h52 - ltp) / h52 * 100 if h52 > 0 else 0.0,
-        }
-    except Exception:
-        return {}
-
-
-def early_stage_adjust(f):
-    """
-    Score adjustment (swing-scale, roughly -63..+47) from extension/early-stage features.
-    Penalises stocks that ALREADY ran; rewards entries BEFORE the move.
-    """
-    if not f or "ret5" not in f:
-        return 0, []
-    adj = 0
-    why = []
-    r3, r5, ext = f["ret3"], f["ret5"], f["ext21"]
-    if r5 >= 7:
-        adj -= 30; why.append(f"⛔ Already ran +{r5:.1f}% in 5d — late entry")
-    elif r5 >= 4.5 or r3 >= 3.5:
-        adj -= 18; why.append(f"⛔ Already +{r5:.1f}% in 5d — mostly priced in")
-    if ext > 7:
-        adj -= 15; why.append(f"⛔ {ext:.1f}% above EMA21 — stretched")
-    uptrend = f["ema21"] > f["ema50"] and f["ltp"] > f["ema50"]
-    if uptrend and 0 <= ext <= 3 and -3 <= r5 <= 2 and 42 <= f["rsi"] <= 58:
-        adj += 20; why.append("✅ Pullback to EMA21 in uptrend — early entry")
-    if uptrend and f["nr7"] and f["from_high"] <= 6 and f["ema9"] >= f["ema21"]:
-        adj += 15; why.append("✅ Tight NR7 coil under highs — pre-breakout")
-    if f["ltp"] > f["high20_prev"] and r5 <= 4.5 and f["vol_ratio"] >= 1.3 and ext <= 5:
-        adj += 12; why.append("✅ Day-1 20-day breakout on volume")
-    return adj, why
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_market_regime():
-    """Nifty 50 trend state: BULL / NEUTRAL / BEAR (UNKNOWN if data unavailable)."""
-    import yfinance as _yf
-    out = {"state": "UNKNOWN", "ret5": 0.0, "ret20": 0.0, "vix": None,
-           "detail": "Nifty trend data unavailable — signals shown with a higher bar."}
-    try:
-        df = _yf.download("^NSEI", period="1y", interval="1d", auto_adjust=True,
-                          progress=False, timeout=30)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        c = df["Close"].dropna()
-        if len(c) < 60:
-            return out
-        e20 = c.ewm(span=20, adjust=False).mean()
-        e50 = c.ewm(span=50, adjust=False).mean()
-        last, a20, a50 = float(c.iloc[-1]), float(e20.iloc[-1]), float(e50.iloc[-1])
-        slope = (float(e20.iloc[-1]) / float(e20.iloc[-6]) - 1) * 100
-        ret5 = (last / float(c.iloc[-6]) - 1) * 100
-        ret20 = (last / float(c.iloc[-21]) - 1) * 100
-        vix = None
-        try:
-            vd = _yf.download("^INDIAVIX", period="1mo", interval="1d", auto_adjust=True,
-                              progress=False, timeout=20)
-            if isinstance(vd.columns, pd.MultiIndex):
-                vd.columns = vd.columns.get_level_values(0)
-            vix = float(vd["Close"].dropna().iloc[-1])
-        except Exception:
-            vix = None
-        if (last < a50 and a20 < a50) or ret5 <= -3.0 or (last < a20 and slope < 0 and ret5 <= -1.5):
-            state = "BEAR"
-        elif last > a20 > a50 and slope > 0:
-            state = "BULL"
-        else:
-            state = "NEUTRAL"
-        if state == "BULL" and vix and vix >= 22:
-            state = "NEUTRAL"
-        detail = (f"Nifty {last:,.0f} | 20-EMA {a20:,.0f} | 50-EMA {a50:,.0f} | "
-                  f"5d {ret5:+.1f}% | 20d {ret20:+.1f}%" + (f" | VIX {vix:.1f}" if vix else ""))
-        return {"state": state, "ret5": ret5, "ret20": ret20, "vix": vix, "detail": detail}
-    except Exception:
-        return out
-
-
-def render_regime_banner(regime):
-    msgs = {
-        "BULL":    ("#0d3320", "#26de81", "🟢 MARKET UPTREND — full signal list active"),
-        "NEUTRAL": ("#3a2f0b", "#f7b731", "🟡 MARKET MIXED — only higher-score signals shown; use smaller size"),
-        "BEAR":    ("#3a0d12", "#ff4757", "🔴 MARKET DOWNTREND — long signals paused. Targets rarely hit in a falling market; staying in cash is a position."),
-        "UNKNOWN": ("#222", "#aaa", "⚪ Market trend unavailable — signals shown with a higher bar"),
-    }
-    bg, fg, text = msgs.get(regime.get("state", "UNKNOWN"), msgs["UNKNOWN"])
-    st.markdown(
-        f'<div style="background:{bg};border-left:4px solid {fg};padding:10px 14px;'
-        f'border-radius:6px;margin:6px 0 10px 0;"><b style="color:{fg}">{text}</b><br>'
-        f'<span style="color:#aab;font-size:0.8rem">{regime.get("detail","")}</span></div>',
-        unsafe_allow_html=True)
-
-
-
-# ═══════════════════════════════════════════════════════════════
 #  DATA FETCH  (cached 10 min)
 # ═══════════════════════════════════════════════════════════════
 @st.cache_data(ttl=600, show_spinner=False)
@@ -389,7 +250,7 @@ def fetch_stock_data():
                     rsi    = float((100-(100/(1+rs))).iloc[-1])
                     vol_ratio  = vol/avg_vol if avg_vol>0 else 1
                     from_high  = (h52-ltp)/h52*100
-                    rows.append({**stock_features(df), "symbol":sym,"ltp":ltp,"prev":prev,"open":open_,
+                    rows.append({"symbol":sym,"ltp":ltp,"prev":prev,"open":open_,
                                  "pchg":pchg,"gap":gap,"h52":h52,"l52":l52,
                                  "vol":vol,"avg_vol":avg_vol,"vol_ratio":vol_ratio,
                                  "ema9":ema9,"ema21":ema21,"ema200":ema200,
@@ -402,88 +263,64 @@ def fetch_stock_data():
 #  SCORING ALGORITHMS
 # ═══════════════════════════════════════════════════════════════
 def intraday_score(s):
-    """Daily-bar intraday ranking. Rewards a measured move with strength INTO the close;
-    penalises gaps/moves that are already exhausted (the 'signal after the rally' problem)."""
     score=0; reasons=[]
-    if 0.3<=s["gap"]<1.5:   score+=15; reasons.append(f"Gap up {s['gap']:+.1f}%")
-    elif 1.5<=s["gap"]<3:   score+=10; reasons.append(f"Gap up {s['gap']:+.1f}%")
-    elif s["gap"]>=3:       score-=15; reasons.append(f"⛔ Gap {s['gap']:+.1f}% — exhaustion risk")
-    if 0.5<=s["pchg"]<2.5:  score+=15; reasons.append(f"+{s['pchg']:.1f}% today")
-    elif s["pchg"]>=3:      score-=10; reasons.append(f"⛔ Already +{s['pchg']:.1f}% — chasing")
+    if s["gap"]>=1.5:   score+=25; reasons.append(f"Gap up {s['gap']:+.1f}%")
+    elif s["gap"]>=0.5: score+=15; reasons.append(f"Gap up {s['gap']:+.1f}%")
+    elif s["gap"]>0:    score+=5
+    if s["pchg"]>=2:    score+=20; reasons.append(f"Strong +{s['pchg']:.1f}%")
+    elif s["pchg"]>=0.5:score+=12; reasons.append(f"+{s['pchg']:.1f}% today")
     if s["vol_ratio"]>=2.5: score+=20; reasons.append(f"Volume {s['vol_ratio']:.1f}x 🔥")
     elif s["vol_ratio"]>=1.5:score+=12; reasons.append(f"Vol {s['vol_ratio']:.1f}x avg")
-    if s.get("close_pos",0.5)>=0.7: score+=10; reasons.append("Closing near day high")
-    if 52<=s["rsi"]<=66:    score+=15; reasons.append(f"RSI {s['rsi']:.0f} momentum")
-    elif 48<=s["rsi"]<52:   score+=8
-    elif s["rsi"]>72:       score-=15; reasons.append(f"⚠️ RSI {s['rsi']:.0f} stretched")
+    if 55<=s["rsi"]<=70:  score+=15; reasons.append(f"RSI {s['rsi']:.0f} momentum")
+    elif 50<=s["rsi"]<55: score+=8
     if s["ltp"]>s["ema9"]>s["ema21"]: score+=15; reasons.append("Above EMA9 & EMA21")
     elif s["ltp"]>s["ema21"]:          score+=7
-    if s["from_high"]<=3:   score+=5; reasons.append("Near 52W High")
-    if s["gap"]<-0.5:       score-=20
-    if s.get("ret5",0)>=6:  score-=20; reasons.append(f"⛔ +{s['ret5']:.1f}% in 5d — already ran")
+    if s["from_high"]<=3: score+=5; reasons.append("Near 52W High")
+    if s["rsi"]>80:  score-=15; reasons.append("⚠️ RSI overbought")
+    if s["gap"]<-0.5:score-=20
     return score, " | ".join(reasons) if reasons else "Moderate setup"
 
 def swing_score(s):
-    """Swing ranking. 52W-high proximity is now worth LESS (it usually means the move
-    already happened); pullback / coil / day-1-breakout earn bonuses, extension is penalised."""
     score=0; reasons=[]
-    if s["from_high"]<=2:   score+=18; reasons.append("At 52W High (breakout — check it hasn't run)")
-    elif s["from_high"]<=5: score+=14; reasons.append(f"Near 52W High ({s['from_high']:.1f}% below)")
+    if s["from_high"]<=2:   score+=30; reasons.append("52W High Breakout 🚀")
+    elif s["from_high"]<=5: score+=22; reasons.append(f"Near 52W High ({s['from_high']:.1f}% below)")
     elif s["from_high"]<=10:score+=12; reasons.append("Within 10% of 52W High")
     if s["ema9"]>s["ema21"]:  score+=20; reasons.append("EMA9>EMA21 ✅ Uptrend")
     else:                      score-=10
-    if 52<=s["rsi"]<=60:   score+=20; reasons.append(f"RSI {s['rsi']:.0f} sweet spot")
-    elif 45<=s["rsi"]<52 or 60<s["rsi"]<=66:  score+=10; reasons.append(f"RSI {s['rsi']:.0f} ok")
-    elif s["rsi"]>70:      score-=15; reasons.append(f"⚠️ RSI {s['rsi']:.0f} overbought")
+    if 50<=s["rsi"]<=65:   score+=20; reasons.append(f"RSI {s['rsi']:.0f} ideal zone")
+    elif 45<=s["rsi"]<50:  score+=10; reasons.append(f"RSI {s['rsi']:.0f} ok")
+    elif s["rsi"]>75:      score-=15; reasons.append(f"⚠️ RSI {s['rsi']:.0f} overbought")
     if s["ltp"]>s["ema200"]:score+=15; reasons.append("Above 200 EMA (bull)")
     else:                   score-=10
     if s["vol_ratio"]>=1.5: score+=15; reasons.append(f"Vol {s['vol_ratio']:.1f}x avg")
     elif s["vol_ratio"]>=1.2:score+=8
     if s["from_high"]>30:  score-=20
-    adj, why = early_stage_adjust(s)
-    score += adj
-    reasons = why + reasons
-    rs = s.get("rs20", 0.0)
-    if rs>=5:   score+=10; reasons.append(f"Outperforming Nifty by {rs:.1f}% (20d)")
-    elif rs<-3: score-=10; reasons.append("Lagging Nifty")
     return score, " | ".join(reasons) if reasons else "Moderate setup"
 
-def compute_targets(ltp, trade_type, atr14=None):
-    """ATR-scaled stop/targets so width adapts to each stock's own volatility.
-    Swing: SL 1.5 ATR, T1 1.5 ATR (1:1), T2 3 ATR. Intraday: SL 0.7, T1 0.8, T2 1.4 ATR."""
-    if not atr14 or atr14<=0:
-        atr14 = ltp*(0.015 if trade_type=="intraday" else 0.02)
+def compute_targets(ltp, trade_type):
     if trade_type=="intraday":
-        sl=round(ltp-0.7*atr14,2); t1=round(ltp+0.8*atr14,2); t2=round(ltp+1.4*atr14,2)
+        sl=round(ltp*0.992,2); t1=round(ltp*1.012,2); t2=round(ltp*1.022,2)
     else:
-        sl=round(ltp-1.5*atr14,2); t1=round(ltp+1.5*atr14,2); t2=round(ltp+3.0*atr14,2)
+        sl=round(ltp*0.97,2);  t1=round(ltp*1.05,2);  t2=round(ltp*1.10,2)
     rr=round((t1-ltp)/(ltp-sl),1) if ltp>sl else 0
     return sl,t1,t2,rr
 
-def get_picks(stocks, regime=None, override=False):
-    state = (regime or {}).get("state","UNKNOWN")
-    if override and state=="BEAR": state="NEUTRAL"
-    if state=="BEAR":
-        return [],[]
-    bump = {"BULL":0,"NEUTRAL":10,"UNKNOWN":5}.get(state,5)
-    n20  = (regime or {}).get("ret20",0.0)
+def get_picks(stocks):
     ip=[]; sw=[]
     for s in stocks:
         ltp=s["ltp"]
-        s["rs20"] = s.get("ret20",0.0) - n20
         i_sc,i_why=intraday_score(s)
         sw_sc,sw_why=swing_score(s)
-        atr=s.get("atr14")
-        sl_i,t1_i,t2_i,rr_i=compute_targets(ltp,"intraday",atr)
-        sl_s,t1_s,t2_s,rr_s=compute_targets(ltp,"swing",atr)
-        if i_sc>=55+bump:
+        sl_i,t1_i,t2_i,rr_i=compute_targets(ltp,"intraday")
+        sl_s,t1_s,t2_s,rr_s=compute_targets(ltp,"swing")
+        if i_sc>=55:
             ip.append({"Symbol":s["symbol"],"LTP":f"₹{ltp:,.2f}",
                 "Change%":f"{s['pchg']:+.2f}%","Score":i_sc,
                 "Entry":f"₹{ltp:,.2f}","Target 1":f"₹{t1_i:,.2f}",
                 "Target 2":f"₹{t2_i:,.2f}","Stop Loss":f"₹{sl_i:,.2f}",
                 "R:R":f"1:{rr_i}","RSI":f"{s['rsi']:.0f}",
                 "Vol":f"{s['vol_ratio']:.1f}x","Why":i_why,"_s":i_sc})
-        if sw_sc>=60+bump:
+        if sw_sc>=60:
             sw.append({"Symbol":s["symbol"],"LTP":f"₹{ltp:,.2f}",
                 "Change%":f"{s['pchg']:+.2f}%","Score":sw_sc,
                 "Entry":f"₹{ltp:,.2f}","Target 1":f"₹{t1_s:,.2f}",
@@ -719,9 +556,6 @@ def fetch_early_radar_data(symbols_tuple):
 
                     rows.append({
                         "symbol": sym, "ltp": ltp, "pchg": pchg, "rsi": rsi,
-                        "ret3": float(ltp / close.iloc[-4] - 1) * 100,
-                        "ret5": float(ltp / close.iloc[-6] - 1) * 100,
-                        "ext21": float(ltp / close.ewm(span=21, adjust=False).mean().iloc[-1] - 1) * 100,
                         "atr14": atr14, "range_pct": range_pct,
                         "vol_trend": vol_trend, "resistance": resistance,
                         "dist_to_resistance": dist_to_resistance,
@@ -738,52 +572,50 @@ def fetch_early_radar_data(symbols_tuple):
 
 def early_prediction_score(s):
     """
-    PRE-breakout scoring. Weights re-tuned from the earlier backtest: RSI sweet spot
-    52-58, resistance distance 2-6.5%, range-contraction/volume-trend weights cut, MACD
-    bonus removed (it was counterproductive). MACD still shown for information.
-    Already-extended stocks are penalised hard (they are 'late', not 'early').
+    Independent scoring model for PRE-breakout setups: volatility contraction
+    + quiet volume accumulation + RSI recovering from neutral + price close
+    to (but not yet past) a resistance level. This intentionally looks for
+    the OPPOSITE lifecycle stage from swing_score() above, which only scores
+    stocks AFTER momentum is already confirmed.
     """
     score = 0
     reasons = []
 
     if s["range_pct"] <= 6:
-        score += 12; reasons.append(f"Tight range {s['range_pct']:.1f}% — coiling")
+        score += 25; reasons.append(f"Tight range {s['range_pct']:.1f}% — coiling")
     elif s["range_pct"] <= 10:
-        score += 6; reasons.append(f"Range {s['range_pct']:.1f}% — narrowing")
+        score += 12; reasons.append(f"Range {s['range_pct']:.1f}% — narrowing")
 
     if s["vol_trend"] >= 1.3:
-        score += 10; reasons.append(f"Volume building {s['vol_trend']:.1f}x — accumulation")
+        score += 20; reasons.append(f"Volume building {s['vol_trend']:.1f}x — accumulation")
     elif s["vol_trend"] >= 1.1:
-        score += 5
+        score += 10
 
-    if 52 <= s["rsi"] <= 58:
-        score += 20; reasons.append(f"RSI {s['rsi']:.0f} — sweet spot")
-    elif 45 <= s["rsi"] < 52 or 58 < s["rsi"] <= 65:
-        score += 8; reasons.append(f"RSI {s['rsi']:.0f}")
+    if 45 <= s["rsi"] <= 55:
+        score += 20; reasons.append(f"RSI {s['rsi']:.0f} — waking up from neutral")
+    elif 55 < s["rsi"] <= 60:
+        score += 10; reasons.append(f"RSI {s['rsi']:.0f} — early momentum")
     elif s["rsi"] > 68:
         score -= 15; reasons.append("⚠️ Already extended — too late for early entry")
 
-    d = s["dist_to_resistance"]
-    if (not s["already_broken"]) and 2 <= d <= 6.5:
-        score += 25; reasons.append(f"{d:.1f}% from breakout trigger")
-    elif (not s["already_broken"]) and 0 < d < 2:
-        score += 12; reasons.append(f"{d:.1f}% from trigger — about to break")
-    elif (not s["already_broken"]) and 6.5 < d <= 10:
-        score += 10; reasons.append("Approaching resistance")
+    if (not s["already_broken"]) and 0 < s["dist_to_resistance"] <= 5:
+        score += 25; reasons.append(f"{s['dist_to_resistance']:.1f}% from breakout trigger")
+    elif (not s["already_broken"]) and 5 < s["dist_to_resistance"] <= 10:
+        score += 12; reasons.append("Approaching resistance")
     elif s["already_broken"]:
-        score -= 20; reasons.append("Already broke out — late")
+        score -= 20; reasons.append("Already broke out — see Swing tab instead")
 
+    # NEW — MACD crossover (borrowed from nifty-swing-screener): confirms
+    # momentum is turning up right now, not just "looking" coiled.
+    if s.get("macd_bull_cross"):
+        score += 15; reasons.append("MACD just crossed bullish 📈")
+    elif s.get("macd_rising"):
+        score += 7; reasons.append("MACD histogram rising")
+
+    # NEW — Support bounce (borrowed from nifty-swing-screener): price held
+    # a real support level and closed strongly off the day's low.
     if s.get("support_bounce"):
         score += 15; reasons.append("Bounced off support with a strong close 🛡️")
-
-    # Extension penalties — the 'it already rallied' filter
-    r5 = s.get("ret5", 0.0); ext = s.get("ext21", 0.0)
-    if r5 >= 7:
-        score -= 30; reasons.append(f"⛔ Already +{r5:.1f}% in 5d")
-    elif r5 >= 4.5 or s.get("ret3", 0.0) >= 3.5:
-        score -= 18; reasons.append(f"⛔ +{r5:.1f}% in 5d — mostly priced in")
-    if ext > 7:
-        score -= 15; reasons.append(f"⛔ {ext:.1f}% above EMA21 — stretched")
 
     if s["from_high"] > 25:
         score -= 10
@@ -793,53 +625,101 @@ def early_prediction_score(s):
 
 def compute_atr_targets(ltp, atr14, resistance):
     """
-    ATR-scaled SL/targets. Previously T1 (1.0 ATR) sat CLOSER than SL (1.5 ATR), which
-    needs a >60% win rate just to break even. Now SL 1.2 ATR, T1 1.5 ATR, T2 3.0 ATR.
+    ATR-scaled SL/targets — separate from the fixed-% compute_targets() used
+    in the existing Intraday/Swing sections, so stop/target width adapts to
+    each stock's own volatility instead of one flat percentage for all.
     """
     if atr14 <= 0:
         atr14 = ltp * 0.02
-    sl = round(ltp - 1.2 * atr14, 2)
-    t1 = round(ltp + 1.5 * atr14, 2)
+    sl = round(ltp - 1.5 * atr14, 2)
+    t1 = round(ltp + 2.0 * atr14, 2)
     t2 = round(ltp + 3.0 * atr14, 2)
     trigger = round(resistance, 2)
     rr = round((t1 - ltp) / (ltp - sl), 1) if ltp > sl else 0
     return sl, t1, t2, trigger, rr
 
-def get_early_picks(stocks, regime=None):
-    state = (regime or {}).get("state", "UNKNOWN")
-    if state == "BEAR":
-        return []
-    min_score = 45 + {"BULL": 0, "NEUTRAL": 10, "UNKNOWN": 5}.get(state, 5)
+@st.cache_data(ttl=600, show_spinner=False)
+def get_simple_market_regime():
+    """Simple NIFTY regime used only to make the BUY/WAIT/AVOID label."""
+    try:
+        d = yf.download("^NSEI", period="6mo", interval="1d", auto_adjust=True,
+                        progress=False, threads=False, timeout=20)
+        if d is None or len(d) < 30:
+            return "🟡 NEUTRAL", "Could not get enough NIFTY data"
+        close = d["Close"]
+        if hasattr(close, "columns"):
+            close = close.iloc[:, 0]
+        close = close.dropna()
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        rsi_delta = close.diff()
+        gain = rsi_delta.clip(lower=0).rolling(14).mean()
+        loss = (-rsi_delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, 0.001)
+        rsi = float((100 - (100/(1+rs))).iloc[-1])
+        last = float(close.iloc[-1])
+        ema = float(ema20.iloc[-1])
+        rising = len(ema20) >= 3 and float(ema20.iloc[-1]) > float(ema20.iloc[-3])
+        if last > ema and rising and rsi >= 50:
+            return "🟢 BULLISH", f"NIFTY above EMA20 · RSI {rsi:.0f}"
+        if last < ema and not rising and rsi < 50:
+            return "🔴 BEARISH", f"NIFTY below EMA20 · RSI {rsi:.0f}"
+        return "🟡 NEUTRAL", f"NIFTY mixed · RSI {rsi:.0f}"
+    except Exception:
+        return "🟡 NEUTRAL", "NIFTY regime unavailable"
+
+def get_early_picks(stocks):
+    """Convert the detailed early score into three plain-language actions.
+
+    BUY NOW is deliberately strict: score >= 80, not already broken out,
+    not extended today, and NIFTY not bearish.
+    """
+    regime, regime_note = get_simple_market_regime()
     picks = []
     for s in stocks:
-        if s.get("ret5", 0.0) >= 6:      # already rallied — not an early setup
-            continue
         sc, why = early_prediction_score(s)
-        if sc >= min_score:
-            sl, t1, t2, trigger, rr = compute_atr_targets(s["ltp"], s["atr14"], s["resistance"])
-            status = "🚀 Just Triggered" if s["already_broken"] else "⏳ Watching"
-            if sc >= 65:
-                overall = "🟢 STRONG"
-            elif sc >= 55:
-                overall = "🟡 MODERATE"
+        if sc < 45:
+            continue
+
+        sl, t1, t2, trigger, rr = compute_atr_targets(s["ltp"], s["atr14"], s["resistance"])
+        extended = bool(s.get("pchg", 0) >= 3.0 or s.get("rsi", 50) > 68)
+        early = bool(not s.get("already_broken", False))
+
+        if sc >= 80 and early and not extended and regime != "🔴 BEARISH":
+            action = "🟢 BUY NOW"
+            simple_reason = "Early setup is strong and stock is not extended."
+        elif sc >= 70 and early and not extended:
+            action = "🟡 WAIT"
+            simple_reason = "Good setup, but wait for stronger confirmation."
+        else:
+            action = "🔴 AVOID"
+            if s.get("already_broken", False):
+                simple_reason = "Move has already started — do not chase."
+            elif extended:
+                simple_reason = "Stock is already extended — wait for a reset."
+            elif regime == "🔴 BEARISH":
+                simple_reason = "Market is bearish — avoid new early buys."
             else:
-                overall = "🟠 WEAK"
-            picks.append({
-                "Symbol": s["symbol"], "LTP": f"₹{s['ltp']:,.2f}",
-                "Signal": overall,
-                "Status": status, "Early Score": sc,
-                "Watch Trigger": f"₹{trigger:,.2f}",
-                "ATR SL": f"₹{sl:,.2f}", "ATR T1": f"₹{t1:,.2f}", "ATR T2": f"₹{t2:,.2f}",
-                "R:R": f"1:{rr}", "RSI": f"{s['rsi']:.0f}",
-                "Range%": f"{s['range_pct']:.1f}%", "Vol Trend": f"{s['vol_trend']:.1f}x",
-                "MACD": "Bull Cross" if s.get("macd_bull_cross") else ("Rising" if s.get("macd_rising") else "-"),
-                "Support Bounce": "Yes ✅" if s.get("support_bounce") else "-",
-                "Why": why, "_s": sc,
-            })
-    picks.sort(key=lambda x: x["_s"], reverse=True)
+                simple_reason = "Setup is not strong enough yet."
+
+        picks.append({
+            "Action": action,
+            "Stock": s["symbol"],
+            "Buy Price": f"₹{s['ltp']:,.2f}",
+            "Stop Loss": f"₹{sl:,.2f}",
+            "Target 1": f"₹{t1:,.2f}",
+            "Target 2": f"₹{t2:,.2f}",
+            "Early Score": int(min(100, max(0, sc))),
+            "Today": f"{s.get('pchg',0):+.1f}%",
+            "Reason": simple_reason,
+            "_score": sc,
+        })
+
+    # Green first, then yellow, then red; within each, strongest score first.
+    order = {"🟢 BUY NOW": 0, "🟡 WAIT": 1, "🔴 AVOID": 2}
+    picks.sort(key=lambda x: (order.get(x["Action"], 9), -x["_score"]))
     for p in picks:
-        del p["_s"]
-    return picks[:25]
+        del p["_score"]
+    return picks[:25], regime, regime_note
 
 # ═══════════════════════════════════════════════════════════════
 #  SMALL CAP RADAR — early momentum / breakout scanner for small caps
@@ -1181,11 +1061,11 @@ def get_smallcap_picks(stocks, min_turnover=MIN_AVG_TURNOVER, min_price=MIN_PRIC
 #  Early Radar and Small Cap Radar are fully independent tabs.
 # ═══════════════════════════════════════════════════════════════
 tab_main, tab_radar, tab_smallcap = st.tabs(
-    ["📊 Main Dashboard", "🔭 Early Radar — Nifty 500", "🚀 Small Cap Radar"]
+    ["📊 Main Dashboard", "🚦 Simple BUY — Nifty 500", "🚀 Small Cap Radar"]
 )
 
 with tab_main:
-    st.markdown('<p class="main-title">📈 Stock Trading Picks</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-title">📈 Stock Trading Picks — V4</p>', unsafe_allow_html=True)
     st.markdown('<p class="sub-title">Intraday · Swing Trading · Exit Signals · Watchlist — All in One Place</p>', unsafe_allow_html=True)
 
     # Top bar
@@ -1214,13 +1094,7 @@ with tab_main:
         st.error("❌ Cannot fetch data. Check internet and try again.")
         st.stop()
 
-    regime = fetch_market_regime()
-    render_regime_banner(regime)
-    _override = False
-    if regime["state"] == "BEAR":
-        _override = st.checkbox("Show long signals anyway (not recommended in a falling market)",
-                                value=False, key="bear_override_main")
-    intraday_picks, swing_picks = get_picks(stocks, regime, override=_override)
+    intraday_picks, swing_picks = get_picks(stocks)
     stocks_dict = {s["symbol"]:s for s in stocks}
     # Restore from browser localStorage if this is a fresh server session
     restore_from_browser()
@@ -1623,155 +1497,83 @@ with tab_main:
     """, unsafe_allow_html=True)
 
 with tab_radar:
-    st.markdown('<p class="main-title">🔭 Early Radar — Nifty 500</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sub-title">Pre-breakout scanner — looks for setups BEFORE the crowd, not after</p>', unsafe_allow_html=True)
+    st.markdown('<p class="main-title">🚦 Simple BUY — Nifty 500</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sub-title">The app does the technical analysis. You only read BUY NOW / WAIT / AVOID.</p>', unsafe_allow_html=True)
 
-    # ── DATA FRESHNESS NOTICE (confirmed, not assumed) ──────────────────
-    st.markdown("""
-    <div style="background:#1a1200;border-left:4px solid #f7b731;border-radius:6px;
-                padding:10px 14px;font-size:0.85rem;color:#f7b731;margin-bottom:10px">
-    ⏱️ <b>Data delay — please read:</b> This tab (and the rest of this app) uses
-    <b>yfinance</b>, which carries roughly the same <b>~15 minute delay</b> as NSE's own
-    free public data feed. It is <b>NOT tick-by-tick live data</b>. True real-time data
-    requires a paid feed or a broker API (e.g. Zerodha Kite Connect), which this
-    app does not use. For swing trades (holding days) 15 min delay barely matters.
-    For fast intraday scalping, treat prices here as "recent," not "this second."
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── HOW IT WORKS — plain-language, color-coded legend ───────────────
     st.markdown("""
     <div style="background:#0a1420;border-radius:10px;padding:14px 16px;margin-bottom:12px">
-    <div style="font-size:1rem;font-weight:700;color:#e8eef4;margin-bottom:10px">
-    🧭 How this tab decides what to show you — in simple words
-    </div>
-
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-
-      <div style="flex:1;min-width:220px;background:#0d2b1a;border-left:4px solid #26de81;
-                  border-radius:6px;padding:10px 12px">
-        <b style="color:#26de81">🌀 Coiling (Tight Range)</b><br>
-        <span style="font-size:0.82rem;color:#b8c4cc">The stock's price has been moving
-        in a narrow band for the last 12 days — like a spring being compressed.
-        Coiled stocks often move fast once they break out.</span>
+      <div style="font-size:1.05rem;font-weight:800;color:#e8eef4;margin-bottom:8px">
+      👇 Your entire decision is here
       </div>
-
-      <div style="flex:1;min-width:220px;background:#1a1a0d;border-left:4px solid #f7b731;
-                  border-radius:6px;padding:10px 12px">
-        <b style="color:#f7b731">👀 Quiet Accumulation</b><br>
-        <span style="font-size:0.82rem;color:#b8c4cc">Trading volume is quietly rising
-        even though the price looks flat. This can mean bigger players are slowly
-        buying before the price moves.</span>
+      <div style="font-size:0.9rem;line-height:1.8;color:#c8d2dc">
+      🟢 <b>BUY NOW</b> = early setup is strong, stock has not already run away, and market is not bearish.<br>
+      🟡 <b>WAIT</b> = setup is developing; do not buy yet.<br>
+      🔴 <b>AVOID</b> = too late, too weak, or market conditions are poor.<br>
+      <span style="color:#8899bb">RSI, EMA, MACD, volume, resistance and ATR are calculated in the background.</span>
       </div>
-
-      <div style="flex:1;min-width:220px;background:#0d1a2b;border-left:4px solid #4b7bec;
-                  border-radius:6px;padding:10px 12px">
-        <b style="color:#4b7bec">📊 RSI Waking Up</b><br>
-        <span style="font-size:0.82rem;color:#b8c4cc">RSI is a 0–100 momentum gauge.
-        We look for RSI climbing out of the neutral 45–55 zone — early momentum,
-        not the already-overheated 70+ zone.</span>
-      </div>
-
-      <div style="flex:1;min-width:220px;background:#2b0d1a;border-left:4px solid #eb3b5a;
-                  border-radius:6px;padding:10px 12px">
-        <b style="color:#eb3b5a">🎯 Near Breakout Trigger</b><br>
-        <span style="font-size:0.82rem;color:#b8c4cc">The price is close to (but has
-        NOT yet crossed) a resistance level it previously struggled to beat.
-        Crossing it is the actual "buy" trigger.</span>
-      </div>
-
-      <div style="flex:1;min-width:220px;background:#1a0d2b;border-left:4px solid #a55eea;
-                  border-radius:6px;padding:10px 12px">
-        <b style="color:#a55eea">📈 MACD Bull Cross</b><br>
-        <span style="font-size:0.82rem;color:#b8c4cc">MACD compares two moving
-        averages. When the fast one crosses above the slow one, it's a classic
-        sign momentum just turned upward.</span>
-      </div>
-
-      <div style="flex:1;min-width:220px;background:#0d2b2b;border-left:4px solid #2bcbba;
-                  border-radius:6px;padding:10px 12px">
-        <b style="color:#2bcbba">🛡️ Support Bounce</b><br>
-        <span style="font-size:0.82rem;color:#b8c4cc">The stock dipped down to a
-        price level it has bounced off before ("support"), then closed strongly
-        higher the same day — a sign buyers stepped in.</span>
-      </div>
-
-    </div>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("""
-    <div class="rule-box">
-    <div class="rule-title">⚠️ Read this before using this tab</div>
-    This tab is <b>experimental</b> and fully separate from the Intraday/Swing sections
-    above. It combines ideas from well-known open-source NSE screeners (PKScreener's
-    consolidation/VCP approach, nifty-swing-screener's MACD + support-bounce signals)
-    with our own volume/RSI logic. It is a <b>higher-probability setup finder, not a
-    guarantee</b>. Many "Watching" stocks will never trigger, and some that trigger
-    will still fail. Treat every row as a candidate to research further — not a
-    buy signal. Scans the Nifty 500 universe (or the closest available fallback
-    list), independently of the 110-stock list used in the sections above.
+    <div style="background:#1a1200;border-left:4px solid #f7b731;border-radius:6px;
+                padding:10px 14px;font-size:0.82rem;color:#f7b731;margin-bottom:10px">
+    ⏱️ <b>Data note:</b> This version uses the existing yfinance data path. It is not tick-by-tick live data.
+    For fast intraday decisions, confirm the displayed price in your broker app before placing an order.
     </div>
     """, unsafe_allow_html=True)
 
-    er_c1, er_c2 = st.columns([3, 1])
-    with er_c1:
-        st.caption("First scan can take 30–60 sec (up to 500 stocks). Cached for 20 min after that.")
-    with er_c2:
-        if st.button("🔭 Run Early Radar Scan", width='stretch', type="primary", key="run_early_radar"):
-            st.session_state["early_radar_ran"] = True
+    if st.button("🔭 Scan Nifty 500", width='stretch', type="primary", key="run_early_radar"):
+        st.session_state["early_radar_ran"] = True
 
     if st.session_state.get("early_radar_ran"):
-        with st.spinner("Scanning Nifty 500 for pre-breakout setups..."):
+        with st.spinner("Scanning Nifty 500 for early setups..."):
             n500_symbols = fetch_nifty500_universe()
             early_raw = fetch_early_radar_data(tuple(n500_symbols))
 
         if not early_raw:
             st.error("❌ Could not fetch Early Radar data. Try again in a moment.")
         else:
-            _er_regime = fetch_market_regime()
-            render_regime_banner(_er_regime)
-            early_picks = get_early_picks(early_raw, _er_regime)
-            st.success(f"✅ Scanned {len(early_raw)} stocks | {len(early_picks)} early setups found")
+            early_picks, regime, regime_note = get_early_picks(early_raw)
+            st.markdown(f"### Market: {regime}")
+            st.caption(regime_note)
 
             if early_picks:
                 df_er = pd.DataFrame(early_picks)
+                # Keep the default table simple; technical columns stay hidden from the main decision view.
                 st.dataframe(
-                    df_er, width='stretch',
-                    height=min(600, 60 + len(df_er) * 38),
-                    hide_index=True,
+                    df_er[["Action","Stock","Buy Price","Stop Loss","Target 1","Target 2","Early Score","Today","Reason"]],
+                    width='stretch', height=min(650, 70 + len(df_er) * 42), hide_index=True,
                     column_config={
-                        "Early Score": st.column_config.ProgressColumn(
-                            "Early Score", min_value=0, max_value=100, format="%d"),
+                        "Action": st.column_config.TextColumn("ACTION", width="small"),
+                        "Stock": st.column_config.TextColumn("STOCK", width="small"),
+                        "Buy Price": st.column_config.TextColumn("BUY PRICE", width="small"),
+                        "Stop Loss": st.column_config.TextColumn("STOP LOSS", width="small"),
+                        "Target 1": st.column_config.TextColumn("TARGET 1", width="small"),
+                        "Target 2": st.column_config.TextColumn("TARGET 2", width="small"),
+                        "Early Score": st.column_config.ProgressColumn("EARLY SCORE", min_value=0, max_value=100, format="%d"),
+                        "Today": st.column_config.TextColumn("TODAY", width="small"),
+                        "Reason": st.column_config.TextColumn("WHY", width="large"),
                     }
                 )
-                st.markdown("""
-                <div style="background:#060e18;border-radius:6px;padding:8px 12px;font-size:0.78rem;color:#336688;margin-top:6px">
-                💡 <b>Signal column = your one-glance mark.</b> 🟢 STRONG (score 70+) = most of the
-                signals lined up together, worth watching closely. 🟡 MODERATE (55–69) = a decent
-                setup but missing a signal or two. 🟠 WEAK (45–54) = passed the minimum bar only —
-                treat as a distant watchlist add, not a priority.<br>
-                💡 <b>⏳ Watching</b> = still consolidating, hasn't crossed the Watch Trigger price yet
-                — add to your own watchlist and check daily.<br>
-                💡 <b>🚀 Just Triggered</b> = price already crossed the trigger — this is now closer to
-                a confirmed breakout, similar to what the Swing tab looks for.<br>
-                💡 <b>ATR SL/T1/T2</b> are volatility-scaled per stock (based on its own 14-day ATR),
-                unlike the fixed % targets used in the existing Swing section.<br>
-                💡 <b>MACD / Support Bounce</b> columns are bonus confirmations, not requirements —
-                a stock can score STRONG from range + volume + RSI alone.
-                </div>
-                """, unsafe_allow_html=True)
+
+                buys = [p for p in early_picks if p["Action"] == "🟢 BUY NOW"]
+                waits = [p for p in early_picks if p["Action"] == "🟡 WAIT"]
+                avoids = [p for p in early_picks if p["Action"] == "🔴 AVOID"]
+                a,b,c = st.columns(3)
+                a.metric("🟢 BUY NOW", len(buys))
+                b.metric("🟡 WAIT", len(waits))
+                c.metric("🔴 AVOID", len(avoids))
+
+                st.info("💡 BUY NOW is a candidate signal, not a guarantee. Check the live broker price and place the stop loss immediately if you trade it.")
             else:
-                st.info("No pre-breakout setups found right now. This is normal — these setups "
-                         "are rarer by design. Try again after market close or tomorrow.")
+                st.info("No early setups found right now. That is better than forcing a trade.")
     else:
-        st.info("👆 Click **Run Early Radar Scan** to scan the Nifty 500 universe for early setups.")
+        st.info("👆 Click **Scan Nifty 500**. The app will reduce the analysis to three simple actions.")
 
     st.markdown("""
     <div class="disclaimer">
-    ⚠️ Early Radar is experimental and has NOT been backtested against historical data yet.
-    Treat results as research leads, not trade signals. Not SEBI investment advice.
-    Always do your own research and use a stop loss.
+    ⚠️ No scanner can guarantee a winning trade. BUY NOW means the rules are aligned; it does not mean the target is guaranteed.
+    Test the strategy with paper trading/backtesting before risking real money.
     </div>
     """, unsafe_allow_html=True)
 
@@ -1825,9 +1627,7 @@ with tab_smallcap:
         if not sc_raw:
             st.error("❌ Could not fetch Small Cap data. Try again in a moment.")
         else:
-            _sc_regime = fetch_market_regime()
-            render_regime_banner(_sc_regime)
-            sc_picks = [] if _sc_regime["state"] == "BEAR" else get_smallcap_picks(
+            sc_picks = get_smallcap_picks(
                 sc_raw,
                 min_turnover=sc_min_turnover_cr * 1e7,
                 min_price=sc_min_price
