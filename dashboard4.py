@@ -1,7 +1,11 @@
 import streamlit as st
 import requests
 import pandas as pd
-import yfinance as yf
+try:
+    import yfinance as yf
+except ModuleNotFoundError:
+    st.error("Missing dependency: yfinance. Please deploy with the included requirements.txt file.")
+    st.stop()
 import numpy as np
 import time
 import warnings
